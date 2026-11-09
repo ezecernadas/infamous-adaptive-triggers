@@ -1,0 +1,471 @@
+diff --git a/build_daemon.ps1 b/build_daemon.ps1
+index b5dbe1b..eddc6c9 100644
+--- a/build_daemon.ps1
++++ b/build_daemon.ps1
+@@ -33,6 +33,7 @@ $srcFiles = @(
+     "$DAEMON_DIR/src/controller_detect.c",
+     "$DAEMON_DIR/src/translator.c",
+     "$DAEMON_DIR/src/generic_hid.c",
++    "$DAEMON_DIR/src/game_trigger.c",
+     "$DAEMON_DIR/src/bt_driver.c"
+ )
+ 
+diff --git a/daemon/include/bt_driver.h b/daemon/include/bt_driver.h
+index 93a9cdf..ca201c1 100644
+--- a/daemon/include/bt_driver.h
++++ b/daemon/include/bt_driver.h
+@@ -71,6 +71,10 @@ void bt_driver_send_rumble_slot(int vpad_slot, uint8_t large, uint8_t small, con
+  */
+ void bt_driver_refresh_settings(void);
+ 
++/* Re-sends each controller's output report with its current rumble and lightbar, e.g. after
++ * the trigger effects changed. */
++void bt_driver_resend_output(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/daemon/include/game_trigger.h b/daemon/include/game_trigger.h
+new file mode 100644
+index 0000000..b67bb6c
+--- /dev/null
++++ b/daemon/include/game_trigger.h
+@@ -0,0 +1,16 @@
++/*
++ * Game-driven DualSense trigger effects: reads the request a game-side plugin writes
++ * (see game_trigger_protocol.h) and hands it to the Bluetooth output path.
++ */
++#ifndef GAME_TRIGGER_H
++#define GAME_TRIGGER_H
++
++#include <stdint.h>
++
++/* Call from the main loop (~50 Hz). Re-sends the controller output when the request changes. */
++void game_trigger_poll(uint64_t now_us);
++
++/* Fills both 11-byte effect blocks and returns 1 while a game request is active. */
++int game_trigger_effects(uint8_t r2[11], uint8_t l2[11]);
++
++#endif
+diff --git a/daemon/include/game_trigger_protocol.h b/daemon/include/game_trigger_protocol.h
+new file mode 100644
+index 0000000..5205914
+--- /dev/null
++++ b/daemon/include/game_trigger_protocol.h
+@@ -0,0 +1,134 @@
++/*
++ * Game -> OneFamily trigger override protocol.
++ *
++ * A game-side GoldHEN plugin writes GAME_TRIGGER_PATH with the DualSense trigger effects the
++ * game wants right now; the daemon applies them instead of the user's dualsense_trigger_mode
++ * while the message is active. The plugin rewrites the file at least every
++ * GAME_TRIGGER_HEARTBEAT_US (bumping `heartbeat`); if it stops (game closed, plugin crash) the
++ * daemon drops the override after GAME_TRIGGER_TIMEOUT_US.
++ *
++ * Wire format (little endian, GAME_TRIGGER_MESSAGE_SIZE bytes):
++ *   0  u32 magic 'OFGT'   4  u8 version   5  u8 flags   6  u16 reserved
++ *   8  u32 seq (changes whenever the effects change)
++ *   12 u8 r2[11]          23 u8 l2[11]    34 u32 heartbeat
++ * This header is shared verbatim with the plugin; keep both copies identical.
++ */
++#ifndef GAME_TRIGGER_PROTOCOL_H
++#define GAME_TRIGGER_PROTOCOL_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define GAME_TRIGGER_PATH          "/data/onefamily/game_triggers.bin"
++#define GAME_TRIGGER_MAGIC         0x5447464fu  /* "OFGT" */
++#define GAME_TRIGGER_VERSION       1
++#define GAME_TRIGGER_FLAG_ACTIVE   0x01
++#define GAME_TRIGGER_EFFECT_SIZE   11
++#define GAME_TRIGGER_MESSAGE_SIZE  38
++#define GAME_TRIGGER_HEARTBEAT_US  500000ULL
++#define GAME_TRIGGER_TIMEOUT_US    2000000ULL
++
++typedef struct {
++    uint32_t magic;
++    uint8_t version;
++    uint8_t flags;
++    uint32_t seq;
++    uint8_t r2[GAME_TRIGGER_EFFECT_SIZE];
++    uint8_t l2[GAME_TRIGGER_EFFECT_SIZE];
++    uint32_t heartbeat;
++} GameTriggerMessage;
++
++static inline void game_trigger_message_init(GameTriggerMessage* m) {
++    memset(m, 0, sizeof(*m));
++    m->magic = GAME_TRIGGER_MAGIC;
++    m->version = GAME_TRIGGER_VERSION;
++    m->r2[0] = 0x05;
++    m->l2[0] = 0x05;
++}
++
++/* DualSense trigger effect modes this protocol accepts (simple and official ones). */
++static inline int game_trigger_mode_known(uint8_t mode) {
++    switch (mode) {
++    case 0x00: case 0x01: case 0x02: case 0x05: case 0x06:
++    case 0x21: case 0x22: case 0x23: case 0x25: case 0x26: case 0x27:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++static inline void game_trigger_encode(const GameTriggerMessage* m, uint8_t out[GAME_TRIGGER_MESSAGE_SIZE]) {
++    memset(out, 0, GAME_TRIGGER_MESSAGE_SIZE);
++    memcpy(out + 0, &m->magic, 4);
++    out[4] = m->version;
++    out[5] = m->flags;
++    memcpy(out + 8, &m->seq, 4);
++    memcpy(out + 12, m->r2, GAME_TRIGGER_EFFECT_SIZE);
++    memcpy(out + 23, m->l2, GAME_TRIGGER_EFFECT_SIZE);
++    memcpy(out + 34, &m->heartbeat, 4);
++}
++
++/* Returns 0 for anything that is not a complete, current, well-formed message. */
++static inline int game_trigger_decode(const uint8_t* buf, int len, GameTriggerMessage* out) {
++    if (!buf || len < GAME_TRIGGER_MESSAGE_SIZE) return 0;
++    GameTriggerMessage m;
++    memset(&m, 0, sizeof(m));
++    memcpy(&m.magic, buf + 0, 4);
++    m.version = buf[4];
++    m.flags = buf[5];
++    memcpy(&m.seq, buf + 8, 4);
++    memcpy(m.r2, buf + 12, GAME_TRIGGER_EFFECT_SIZE);
++    memcpy(m.l2, buf + 23, GAME_TRIGGER_EFFECT_SIZE);
++    memcpy(&m.heartbeat, buf + 34, 4);
++    if (m.magic != GAME_TRIGGER_MAGIC || m.version != GAME_TRIGGER_VERSION) return 0;
++    if (!game_trigger_mode_known(m.r2[0]) || !game_trigger_mode_known(m.l2[0])) return 0;
++    *out = m;
++    return 1;
++}
++
++/* Daemon-side state. */
++typedef struct {
++    int have;
++    int active;
++    int expired;                 /* dropped for silence; only a newer message brings it back */
++    uint32_t seq;
++    uint32_t heartbeat;
++    uint64_t last_heard_us;
++    uint8_t r2[GAME_TRIGGER_EFFECT_SIZE];
++    uint8_t l2[GAME_TRIGGER_EFFECT_SIZE];
++} GameTriggerOverride;
++
++static inline void game_trigger_override_init(GameTriggerOverride* o) { memset(o, 0, sizeof(*o)); }
++
++static inline int game_trigger_override_active(const GameTriggerOverride* o) { return o->active; }
++
++/* Returns 1 when the requested effects changed (the controller needs a new output report). */
++/* The game's last message stays on disk after it closes and is read on every poll, so a message
++ * counts only when it is newer (seq or heartbeat) than the last one seen; an expired override
++ * stays dropped until then. */
++static inline int game_trigger_override_update(GameTriggerOverride* o, const GameTriggerMessage* m, uint64_t now_us) {
++    int fresh = !o->have || m->seq != o->seq || m->heartbeat != o->heartbeat;
++    if (!fresh) return 0;
++    int changed = !o->have || m->seq != o->seq || o->expired;
++    o->last_heard_us = now_us;
++    o->have = 1;
++    o->expired = 0;
++    o->seq = m->seq;
++    o->heartbeat = m->heartbeat;
++    if (changed) {
++        o->active = (m->flags & GAME_TRIGGER_FLAG_ACTIVE) != 0;
++        memcpy(o->r2, m->r2, GAME_TRIGGER_EFFECT_SIZE);
++        memcpy(o->l2, m->l2, GAME_TRIGGER_EFFECT_SIZE);
++    }
++    return changed;
++}
++
++/* Returns 1 when the override was dropped because the game went quiet. */
++static inline int game_trigger_override_expire(GameTriggerOverride* o, uint64_t now_us) {
++    if (!o->active || now_us - o->last_heard_us < GAME_TRIGGER_TIMEOUT_US) return 0;
++    o->active = 0;
++    o->expired = 1;
++    return 1;
++}
++
++#endif
+diff --git a/daemon/src/bt_driver.c b/daemon/src/bt_driver.c
+index 8e1e068..b486001 100644
+--- a/daemon/src/bt_driver.c
++++ b/daemon/src/bt_driver.c
+@@ -6,6 +6,7 @@
+  * touchpad coordinate remapping (1920x1080 -> 1920x942), and Bluetooth force feedback.
+  */
+ 
++#include "game_trigger.h"
+ #include "bt_driver.h"
+ #include "usb_driver.h"
+ #include "translator.h"
+@@ -61,6 +62,8 @@ typedef struct {
+     uint64_t away_since;      // timestamp when pad went silent during grace period
+     uint64_t last_output_time;// timestamp of last sent output report (rumble / keep-alive)
+     uint8_t  last_color[3];   // cached current lightbar color for keep-alive reports
++    uint8_t  last_large;      // last rumble levels sent, so the output can be re-sent unchanged
++    uint8_t  last_small;
+     uint32_t reports_seen;
+     uint32_t decode_drops;
+     uint8_t  last_drop_len;
+@@ -1707,6 +1710,8 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
+     if (dev->output_unsupported || !dev->capacity_patched) return;
+ 
+     dev->last_output_time = daemon_sys_time_us();
++    dev->last_large = large;
++    dev->last_small = small;
+     if (color && (color[0] || color[1] || color[2])) {
+         dev->last_color[0] = color[0];
+         dev->last_color[1] = color[1];
+@@ -1731,9 +1736,12 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
+         out[5] = small;             // Weak motor
+         out[6] = large;             // Strong motor
+ 
+-        // 1. Adaptive Trigger Effects (calibrated physical presets for DualSense Simple Modes)
++        // 1. Adaptive Trigger Effects (right trigger block at out[13], left at out[24]).
++        // A game plugin's request (game_trigger.c) wins over the user's preset while active.
+         int trig = g_daemon_config.dualsense_trigger_mode;
+-        if (trig == 1) {
++        if (game_trigger_effects(&out[13], &out[24])) {
++            // game-driven effects already written
++        } else if (trig == 1) {
+             // Hair Trigger: firm snap click between ~12% (0x20) and ~31% (0x50) of travel at full strength (0xFF)
+             out[13] = 0x02; out[14] = 0x20; out[15] = 0x50; out[16] = 0xFF;
+             out[24] = 0x02; out[25] = 0x20; out[26] = 0x50; out[27] = 0xFF;
+@@ -1874,6 +1882,14 @@ void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3])
+     }
+ }
+ 
++void bt_driver_resend_output(void) {
++    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
++        if (s_devices[i].connected) {
++            bt_send_rumble_dev(&s_devices[i], s_devices[i].last_large, s_devices[i].last_small, s_devices[i].last_color);
++        }
++    }
++}
++
+ void bt_driver_refresh_settings(void) {
+     usb_driver_load_remap_for_bt();
+     uint8_t default_color[3] = { 0, 112, 209 };
+diff --git a/daemon/src/game_trigger.c b/daemon/src/game_trigger.c
+new file mode 100644
+index 0000000..70046f5
+--- /dev/null
++++ b/daemon/src/game_trigger.c
+@@ -0,0 +1,49 @@
++#include "game_trigger.h"
++
++#include <string.h>
++
++#include "bt_driver.h"
++#include "daemon_syscalls.h"
++#include "game_trigger_protocol.h"
++#include "log.h"
++
++static GameTriggerOverride s_override;
++static int s_initialized;
++
++void game_trigger_poll(uint64_t now_us) {
++    if (!s_initialized) {
++        game_trigger_override_init(&s_override);
++        s_initialized = 1;
++    }
++
++    int changed = 0;
++    int fd = daemon_sys_open(GAME_TRIGGER_PATH, 0 /* O_RDONLY */, 0);
++    if (fd >= 0) {
++        uint8_t buf[GAME_TRIGGER_MESSAGE_SIZE];
++        int n = daemon_sys_read(fd, buf, sizeof(buf));
++        daemon_sys_close(fd);
++        GameTriggerMessage m;
++        if (game_trigger_decode(buf, n, &m)) {
++            int was_active = game_trigger_override_active(&s_override);
++            changed = game_trigger_override_update(&s_override, &m, now_us);
++            if (changed && was_active != game_trigger_override_active(&s_override)) {
++                daemon_log(LOG_LEVEL_INFO, "Game trigger override %s (seq=%u)",
++                           game_trigger_override_active(&s_override) ? "on" : "off", m.seq);
++            }
++        }
++    }
++
++    if (game_trigger_override_expire(&s_override, now_us)) {
++        daemon_log(LOG_LEVEL_INFO, "Game trigger override expired: back to the user's trigger setting");
++        changed = 1;
++    }
++
++    if (changed) bt_driver_resend_output();
++}
++
++int game_trigger_effects(uint8_t r2[11], uint8_t l2[11]) {
++    if (!s_initialized || !game_trigger_override_active(&s_override)) return 0;
++    memcpy(r2, s_override.r2, GAME_TRIGGER_EFFECT_SIZE);
++    memcpy(l2, s_override.l2, GAME_TRIGGER_EFFECT_SIZE);
++    return 1;
++}
+diff --git a/daemon/src/main.c b/daemon/src/main.c
+index 7cf0024..e00e7e9 100644
+--- a/daemon/src/main.c
++++ b/daemon/src/main.c
+@@ -3,6 +3,7 @@
+  * Entry Point and Service Manager
+  */
+ 
++#include "game_trigger.h"
+ #include "vpad.h"
+ #include "usb_driver.h"
+ #include "bt_driver.h"
+@@ -114,6 +115,11 @@ int main(int argc, char *argv[]) {
+             check_vibe_file();
+         }
+ 
++        // Game-driven trigger effects from a game plugin (~50 Hz = every 5 loops)
++        if (loop_count % 5 == 0) {
++            game_trigger_poll(daemon_sys_time_us());
++        }
++
+         // Check if mapping reload was requested by Companion App (~10 Hz = every 25 loops)
+         if (loop_count % 25 == 0) {
+             int reload_fd = daemon_sys_open("/data/onefamily/onefamily.reload", 0 /* O_RDONLY */, 0);
+diff --git a/daemon/tests/.gitignore b/daemon/tests/.gitignore
+new file mode 100644
+index 0000000..f233dce
+--- /dev/null
++++ b/daemon/tests/.gitignore
+@@ -0,0 +1 @@
++test_game_trigger
+diff --git a/daemon/tests/Makefile b/daemon/tests/Makefile
+new file mode 100644
+index 0000000..7a4c1ed
+--- /dev/null
++++ b/daemon/tests/Makefile
+@@ -0,0 +1,14 @@
++# Host-side unit tests (no PS4 toolchain needed): make -C daemon/tests
++CC ?= cc
++CFLAGS = -std=c11 -Wall -Wextra -Werror -I../include
++
++test: test_game_trigger
++	./test_game_trigger
++
++test_game_trigger: test_game_trigger.c ../include/game_trigger_protocol.h
++	$(CC) $(CFLAGS) -o $@ test_game_trigger.c
++
++clean:
++	rm -f test_game_trigger
++
++.PHONY: test clean
+diff --git a/daemon/tests/test_game_trigger.c b/daemon/tests/test_game_trigger.c
+new file mode 100644
+index 0000000..00b2400
+--- /dev/null
++++ b/daemon/tests/test_game_trigger.c
+@@ -0,0 +1,110 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "game_trigger_protocol.h"
++
++static void sample(GameTriggerMessage* m, uint32_t seq, uint8_t r2_mode) {
++    memset(m, 0, sizeof(*m));
++    game_trigger_message_init(m);
++    m->flags = GAME_TRIGGER_FLAG_ACTIVE;
++    m->seq = seq;
++    m->r2[0] = r2_mode;
++    m->l2[0] = 0x05;
++}
++
++static void test_message_round_trip(void) {
++    GameTriggerMessage m, out;
++    sample(&m, 7, 0x06);
++    uint8_t buf[GAME_TRIGGER_MESSAGE_SIZE];
++    game_trigger_encode(&m, buf);
++    assert(game_trigger_decode(buf, sizeof(buf), &out));
++    assert(out.seq == 7 && out.r2[0] == 0x06 && out.flags == GAME_TRIGGER_FLAG_ACTIVE);
++}
++
++static void test_rejects_bad_input(void) {
++    GameTriggerMessage m, out;
++    sample(&m, 1, 0x06);
++    uint8_t buf[GAME_TRIGGER_MESSAGE_SIZE];
++    game_trigger_encode(&m, buf);
++    assert(!game_trigger_decode(buf, sizeof(buf) - 1, &out));   /* short read */
++    buf[0] ^= 0xff;
++    assert(!game_trigger_decode(buf, sizeof(buf), &out));       /* wrong magic */
++    game_trigger_encode(&m, buf);
++    buf[4] = 99;
++    assert(!game_trigger_decode(buf, sizeof(buf), &out));       /* unknown version */
++    game_trigger_encode(&m, buf);
++    buf[12] = 0x77;                                             /* r2 mode not a known effect */
++    assert(!game_trigger_decode(buf, sizeof(buf), &out));
++}
++
++static void test_override_follows_messages(void) {
++    GameTriggerOverride o; game_trigger_override_init(&o);
++    GameTriggerMessage m;
++    sample(&m, 1, 0x06);
++    assert(game_trigger_override_update(&o, &m, 1000) == 1);   /* changed */
++    assert(game_trigger_override_active(&o));
++    assert(game_trigger_override_update(&o, &m, 2000) == 0);   /* same seq: nothing new */
++    m.flags = 0; m.seq = 2;
++    assert(game_trigger_override_update(&o, &m, 3000) == 1);
++    assert(!game_trigger_override_active(&o));                  /* game released the trigger */
++}
++
++static void test_override_expires_without_heartbeat(void) {
++    GameTriggerOverride o; game_trigger_override_init(&o);
++    GameTriggerMessage m;
++    sample(&m, 1, 0x06);
++    game_trigger_override_update(&o, &m, 0);
++    assert(game_trigger_override_expire(&o, GAME_TRIGGER_TIMEOUT_US - 1) == 0);
++    assert(game_trigger_override_active(&o));
++    assert(game_trigger_override_expire(&o, GAME_TRIGGER_TIMEOUT_US) == 1);   /* game gone */
++    assert(!game_trigger_override_active(&o));
++}
++
++static void test_heartbeat_keeps_it_alive(void) {
++    GameTriggerOverride o; game_trigger_override_init(&o);
++    GameTriggerMessage m;
++    sample(&m, 1, 0x06);
++    game_trigger_override_update(&o, &m, 0);
++    m.heartbeat = 1;                       /* same effect, newer heartbeat */
++    assert(game_trigger_override_update(&o, &m, GAME_TRIGGER_TIMEOUT_US - 10) == 0);
++    assert(game_trigger_override_expire(&o, GAME_TRIGGER_TIMEOUT_US + 10) == 0);
++    assert(game_trigger_override_active(&o));
++}
++
++static void test_stale_file_after_the_game_closed_is_not_reapplied(void) {
++    /* The game is closed: its last message stays on disk and is read again on every poll */
++    GameTriggerOverride o; game_trigger_override_init(&o);
++    GameTriggerMessage m;
++    sample(&m, 9, 0x21);
++    game_trigger_override_update(&o, &m, 0);
++    assert(game_trigger_override_expire(&o, GAME_TRIGGER_TIMEOUT_US) == 1);
++    for (uint64_t t = GAME_TRIGGER_TIMEOUT_US; t < 10 * GAME_TRIGGER_TIMEOUT_US; t += 20000) {
++        assert(game_trigger_override_update(&o, &m, t) == 0);   /* nothing new: no resend */
++        assert(game_trigger_override_expire(&o, t) == 0);        /* and no expire/reapply loop */
++        assert(!game_trigger_override_active(&o));
++    }
++}
++
++static void test_game_back_after_expiry_takes_over_again(void) {
++    GameTriggerOverride o; game_trigger_override_init(&o);
++    GameTriggerMessage m;
++    sample(&m, 9, 0x21);
++    game_trigger_override_update(&o, &m, 0);
++    game_trigger_override_expire(&o, GAME_TRIGGER_TIMEOUT_US);
++    m.heartbeat = 1;                       /* the game was only stalled: same seq, new heartbeat */
++    assert(game_trigger_override_update(&o, &m, GAME_TRIGGER_TIMEOUT_US + 5) == 1);
++    assert(game_trigger_override_active(&o) && o.r2[0] == 0x21);
++}
++
++int main(void) {
++    test_stale_file_after_the_game_closed_is_not_reapplied();
++    test_game_back_after_expiry_takes_over_again();
++    test_message_round_trip();
++    test_rejects_bad_input();
++    test_override_follows_messages();
++    test_override_expires_without_heartbeat();
++    test_heartbeat_keeps_it_alive();
++    puts("test_game_trigger: all passed");
++    return 0;
++}

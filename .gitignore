@@ -1,0 +1,6 @@
+bin/
+plugin/build/
+plugin/*.so
+common/git_ver.h
+plugin/tests/test_*
+!plugin/tests/test_*.c
