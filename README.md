@@ -38,11 +38,13 @@ For every mapped power:
 - A **DualSense** paired over Bluetooth through **OneFamily**, running a daemon that reads the game
   trigger request file. Official OneFamily builds don't read it yet
   ([proposal: ChiricoG/OneFamily#66](https://github.com/ChiricoG/OneFamily/issues/66)). The release
-  ships a build of OneFamily v1.2.2-beta16 with that change. See [`onefamily/`](onefamily/).
+  ships a build of OneFamily v1.2.2-beta14 with that change. Newer OneFamily daemons (beta15 and
+  later, including v1.2.2 stable) keep the DualSense in a Bluetooth mode that ignores trigger
+  effects, so they can't be used. See [`onefamily/`](onefamily/).
 
 ## Installation
 
-1. **OneFamily:** install the official v1.2.2-beta16 companion app, then replace the daemon
+1. **OneFamily:** install the OneFamily companion app, then replace the daemon
    payload that GoldHEN's AutoRun loads with the `onefamily.bin` from this release. If the
    companion offers to install its own daemon, decline, because it would overwrite this one.
 2. **Plugin:** copy `infamous_triggers.prx` to `/data/GoldHEN/plugins/` and add it under the
@@ -105,6 +107,8 @@ make -C plugin/tests
 - Concrete is not mapped, and L2 has no effects yet.
 - The effects were tuned by hand on one DualSense. The official effects' strengths don't feel the
   same on every controller.
+- The bundled daemon is based on OneFamily v1.2.2-beta14, which can still hit the Bluetooth input
+  freeze that beta15 fixed.
 - Requests reach the daemon through a polled file, so an effect can arrive up to ~30 ms late.
 
 ## Credits

@@ -1,11 +1,12 @@
 diff --git a/build_daemon.ps1 b/build_daemon.ps1
-index b5dbe1b..eddc6c9 100644
+index b5dbe1b..fea5977 100644
 --- a/build_daemon.ps1
 +++ b/build_daemon.ps1
-@@ -33,6 +33,7 @@ $srcFiles = @(
+@@ -33,6 +33,8 @@ $srcFiles = @(
      "$DAEMON_DIR/src/controller_detect.c",
      "$DAEMON_DIR/src/translator.c",
      "$DAEMON_DIR/src/generic_hid.c",
++    "$DAEMON_DIR/src/dualsense_trigger.c",
 +    "$DAEMON_DIR/src/game_trigger.c",
      "$DAEMON_DIR/src/bt_driver.c"
  )
@@ -25,6 +26,42 @@ index 93a9cdf..ca201c1 100644
  #ifdef __cplusplus
  }
  #endif
+diff --git a/daemon/include/dualsense_trigger.h b/daemon/include/dualsense_trigger.h
+new file mode 100644
+index 0000000..dbde45f
+--- /dev/null
++++ b/daemon/include/dualsense_trigger.h
+@@ -0,0 +1,30 @@
++/*
++ * DualSense adaptive trigger presets for output report 0x31.
++ * The "simple" effect modes (0x01, 0x02, 0x06) take raw 0-255 parameters,
++ * unlike the zone-based official effects (0x21/0x25/0x26) that use
++ * positions 0-9 and strengths 1-8. Reference: Nielk1's TriggerEffectGenerator.
++ */
++#ifndef DUALSENSE_TRIGGER_H
++#define DUALSENSE_TRIGGER_H
++
++#include <stdint.h>
++
++#define DS_TRIGGER_EFFECT_SIZE 11
++
++#define DS_TRIGGER_MODE_OFF        0x05
++#define DS_TRIGGER_MODE_FEEDBACK   0x01
++#define DS_TRIGGER_MODE_WEAPON     0x02
++#define DS_TRIGGER_MODE_VIBRATION  0x06
++
++/* Preset ids as stored in dualsense_trigger_mode. */
++enum {
++    DS_TRIGGER_PRESET_OFF        = 0,
++    DS_TRIGGER_PRESET_HAIR       = 1,
++    DS_TRIGGER_PRESET_RESISTANCE = 2,
++    DS_TRIGGER_PRESET_VIBRATION  = 3,
++};
++
++/* Writes the 11-byte effect block for one trigger. Unknown presets turn the effect off. */
++void dualsense_trigger_effect(int preset, uint8_t out[DS_TRIGGER_EFFECT_SIZE]);
++
++#endif
 diff --git a/daemon/include/game_trigger.h b/daemon/include/game_trigger.h
 new file mode 100644
 index 0000000..b67bb6c
@@ -188,18 +225,19 @@ index 0000000..5205914
 +
 +#endif
 diff --git a/daemon/src/bt_driver.c b/daemon/src/bt_driver.c
-index 8e1e068..b486001 100644
+index 9296998..e702ac6 100644
 --- a/daemon/src/bt_driver.c
 +++ b/daemon/src/bt_driver.c
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,8 @@
   * touchpad coordinate remapping (1920x1080 -> 1920x942), and Bluetooth force feedback.
   */
  
++#include "dualsense_trigger.h"
 +#include "game_trigger.h"
  #include "bt_driver.h"
  #include "usb_driver.h"
  #include "translator.h"
-@@ -61,6 +62,8 @@ typedef struct {
+@@ -61,6 +63,8 @@ typedef struct {
      uint64_t away_since;      // timestamp when pad went silent during grace period
      uint64_t last_output_time;// timestamp of last sent output report (rumble / keep-alive)
      uint8_t  last_color[3];   // cached current lightbar color for keep-alive reports
@@ -208,7 +246,7 @@ index 8e1e068..b486001 100644
      uint32_t reports_seen;
      uint32_t decode_drops;
      uint8_t  last_drop_len;
-@@ -1707,6 +1710,8 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
+@@ -1716,6 +1720,8 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
      if (dev->output_unsupported || !dev->capacity_patched) return;
  
      dev->last_output_time = daemon_sys_time_us();
@@ -217,22 +255,37 @@ index 8e1e068..b486001 100644
      if (color && (color[0] || color[1] || color[2])) {
          dev->last_color[0] = color[0];
          dev->last_color[1] = color[1];
-@@ -1731,9 +1736,12 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
+@@ -1740,24 +1746,11 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
          out[5] = small;             // Weak motor
          out[6] = large;             // Strong motor
  
--        // 1. Adaptive Trigger Effects (calibrated physical presets for DualSense Simple Modes)
-+        // 1. Adaptive Trigger Effects (right trigger block at out[13], left at out[24]).
-+        // A game plugin's request (game_trigger.c) wins over the user's preset while active.
-         int trig = g_daemon_config.dualsense_trigger_mode;
+-        // 1. Adaptive Trigger Effects
+-        int trig = g_daemon_config.dualsense_trigger_mode;
 -        if (trig == 1) {
-+        if (game_trigger_effects(&out[13], &out[24])) {
-+            // game-driven effects already written
-+        } else if (trig == 1) {
-             // Hair Trigger: firm snap click between ~12% (0x20) and ~31% (0x50) of travel at full strength (0xFF)
-             out[13] = 0x02; out[14] = 0x20; out[15] = 0x50; out[16] = 0xFF;
-             out[24] = 0x02; out[25] = 0x20; out[26] = 0x50; out[27] = 0xFF;
-@@ -1874,6 +1882,14 @@ void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3])
+-            // Hair Trigger (rigid snap click at ~10% travel)
+-            out[13] = 0x02; out[14] = 0x01; out[15] = 0x02; out[16] = 0x08;
+-            out[24] = 0x02; out[25] = 0x01; out[26] = 0x02; out[27] = 0x08;
+-        } else if (trig == 2) {
+-            // Continuous Resistance
+-            out[13] = 0x01; out[14] = 0x00; out[15] = 0x06;
+-            out[24] = 0x01; out[25] = 0x00; out[26] = 0x06;
+-        } else if (trig == 3) {
+-            // Vibration / Pulsation
+-            out[13] = 0x06; out[14] = 0x01; out[15] = 0x04; out[16] = 0x20;
+-            out[24] = 0x06; out[25] = 0x01; out[26] = 0x04; out[27] = 0x20;
+-        } else {
+-            // Standard / Off
+-            out[13] = 0x00;
+-            out[24] = 0x00;
++        // 1. Adaptive Trigger Effects (right trigger block at out[13], left at out[24])
++        // A game plugin's request (game_trigger.c) wins over the user's preset while active
++        if (!game_trigger_effects(&out[13], &out[24])) {
++            dualsense_trigger_effect(g_daemon_config.dualsense_trigger_mode, &out[13]);
++            dualsense_trigger_effect(g_daemon_config.dualsense_trigger_mode, &out[24]);
+         }
+ 
+         // 2. LED Brightness
+@@ -1883,6 +1876,14 @@ void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3])
      }
  }
  
@@ -247,6 +300,45 @@ index 8e1e068..b486001 100644
  void bt_driver_refresh_settings(void) {
      usb_driver_load_remap_for_bt();
      uint8_t default_color[3] = { 0, 112, 209 };
+diff --git a/daemon/src/dualsense_trigger.c b/daemon/src/dualsense_trigger.c
+new file mode 100644
+index 0000000..567e594
+--- /dev/null
++++ b/daemon/src/dualsense_trigger.c
+@@ -0,0 +1,33 @@
++#include "dualsense_trigger.h"
++
++#include <string.h>
++
++void dualsense_trigger_effect(int preset, uint8_t out[DS_TRIGGER_EFFECT_SIZE]) {
++    memset(out, 0, DS_TRIGGER_EFFECT_SIZE);
++
++    switch (preset) {
++    case DS_TRIGGER_PRESET_HAIR:
++        // Firm click right after the trigger starts moving (~12% to ~30% of travel)
++        out[0] = DS_TRIGGER_MODE_WEAPON;
++        out[1] = 0x20;  // start position
++        out[2] = 0x50;  // end position (resistance releases here)
++        out[3] = 0xFF;  // strength
++        break;
++    case DS_TRIGGER_PRESET_RESISTANCE:
++        // Medium resistance over the whole travel
++        out[0] = DS_TRIGGER_MODE_FEEDBACK;
++        out[1] = 0x00;  // start position
++        out[2] = 0x64;  // strength
++        break;
++    case DS_TRIGGER_PRESET_VIBRATION:
++        out[0] = DS_TRIGGER_MODE_VIBRATION;
++        out[1] = 0x0C;  // frequency (Hz)
++        out[2] = 0xC8;  // amplitude
++        out[3] = 0x00;  // start position
++        break;
++    default:
++        // Mode 0x05 actively releases the motor; 0x00 would leave the last effect applied
++        out[0] = DS_TRIGGER_MODE_OFF;
++        break;
++    }
++}
 diff --git a/daemon/src/game_trigger.c b/daemon/src/game_trigger.c
 new file mode 100644
 index 0000000..70046f5
@@ -303,7 +395,7 @@ index 0000000..70046f5
 +    return 1;
 +}
 diff --git a/daemon/src/main.c b/daemon/src/main.c
-index 7cf0024..e00e7e9 100644
+index 1a4a2b8..888d279 100644
 --- a/daemon/src/main.c
 +++ b/daemon/src/main.c
 @@ -3,6 +3,7 @@
@@ -326,33 +418,103 @@ index 7cf0024..e00e7e9 100644
          // Check if mapping reload was requested by Companion App (~10 Hz = every 25 loops)
          if (loop_count % 25 == 0) {
              int reload_fd = daemon_sys_open("/data/onefamily/onefamily.reload", 0 /* O_RDONLY */, 0);
-diff --git a/daemon/tests/.gitignore b/daemon/tests/.gitignore
-new file mode 100644
-index 0000000..f233dce
---- /dev/null
-+++ b/daemon/tests/.gitignore
-@@ -0,0 +1 @@
-+test_game_trigger
 diff --git a/daemon/tests/Makefile b/daemon/tests/Makefile
 new file mode 100644
-index 0000000..7a4c1ed
+index 0000000..bb0efee
 --- /dev/null
 +++ b/daemon/tests/Makefile
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,18 @@
 +# Host-side unit tests (no PS4 toolchain needed): make -C daemon/tests
 +CC ?= cc
 +CFLAGS = -std=c11 -Wall -Wextra -Werror -I../include
 +
-+test: test_game_trigger
++test: test_dualsense_trigger test_game_trigger
++	./test_dualsense_trigger
 +	./test_game_trigger
++
++test_dualsense_trigger: test_dualsense_trigger.c ../src/dualsense_trigger.c
++	$(CC) $(CFLAGS) -o $@ $^
 +
 +test_game_trigger: test_game_trigger.c ../include/game_trigger_protocol.h
 +	$(CC) $(CFLAGS) -o $@ test_game_trigger.c
 +
 +clean:
-+	rm -f test_game_trigger
++	rm -f test_dualsense_trigger test_game_trigger
 +
 +.PHONY: test clean
+diff --git a/daemon/tests/test_dualsense_trigger.c b/daemon/tests/test_dualsense_trigger.c
+new file mode 100644
+index 0000000..5c72a30
+--- /dev/null
++++ b/daemon/tests/test_dualsense_trigger.c
+@@ -0,0 +1,67 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "dualsense_trigger.h"
++
++static void fill(int preset, uint8_t* e) {
++    memset(e, 0xAA, DS_TRIGGER_EFFECT_SIZE);
++    dualsense_trigger_effect(preset, e);
++}
++
++static void assert_tail_zero(const uint8_t* e, int from) {
++    for (int i = from; i < DS_TRIGGER_EFFECT_SIZE; i++) assert(e[i] == 0);
++}
++
++static void test_off_resets_the_motor(void) {
++    uint8_t e[DS_TRIGGER_EFFECT_SIZE];
++    fill(DS_TRIGGER_PRESET_OFF, e);
++    assert(e[0] == DS_TRIGGER_MODE_OFF);
++    assert_tail_zero(e, 1);
++}
++
++static void test_unknown_preset_is_off(void) {
++    uint8_t e[DS_TRIGGER_EFFECT_SIZE];
++    fill(42, e);
++    assert(e[0] == DS_TRIGGER_MODE_OFF);
++    fill(-1, e);
++    assert(e[0] == DS_TRIGGER_MODE_OFF);
++}
++
++static void test_hair_trigger_is_an_early_firm_click(void) {
++    uint8_t e[DS_TRIGGER_EFFECT_SIZE];
++    fill(DS_TRIGGER_PRESET_HAIR, e);
++    assert(e[0] == DS_TRIGGER_MODE_WEAPON);
++    assert(e[1] < 0x40);          /* starts early in the travel */
++    assert(e[2] > e[1]);          /* click releases after the start */
++    assert(e[3] >= 0xC0);         /* strong enough to feel */
++    assert_tail_zero(e, 4);
++}
++
++static void test_resistance_is_perceptible(void) {
++    uint8_t e[DS_TRIGGER_EFFECT_SIZE];
++    fill(DS_TRIGGER_PRESET_RESISTANCE, e);
++    assert(e[0] == DS_TRIGGER_MODE_FEEDBACK);
++    assert(e[1] == 0x00);         /* from the top of the travel */
++    assert(e[2] >= 0x64);         /* at least medium on the 0-255 scale */
++    assert_tail_zero(e, 3);
++}
++
++static void test_vibration_has_real_amplitude_and_frequency(void) {
++    uint8_t e[DS_TRIGGER_EFFECT_SIZE];
++    fill(DS_TRIGGER_PRESET_VIBRATION, e);
++    assert(e[0] == DS_TRIGGER_MODE_VIBRATION);
++    assert(e[1] >= 5);            /* frequency in Hz */
++    assert(e[2] >= 0x64);         /* amplitude */
++    assert_tail_zero(e, 4);
++}
++
++int main(void) {
++    test_off_resets_the_motor();
++    test_unknown_preset_is_off();
++    test_hair_trigger_is_an_early_firm_click();
++    test_resistance_is_perceptible();
++    test_vibration_has_real_amplitude_and_frequency();
++    puts("test_dualsense_trigger: all passed");
++    return 0;
++}
 diff --git a/daemon/tests/test_game_trigger.c b/daemon/tests/test_game_trigger.c
 new file mode 100644
 index 0000000..00b2400
